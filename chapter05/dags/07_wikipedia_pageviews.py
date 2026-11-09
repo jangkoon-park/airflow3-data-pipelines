@@ -1,0 +1,82 @@
+from urllib import request
+
+import pendulum
+from airflow.sdk import DAG
+from airflow.providers.standard.operators.bash import BashOperator
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.timetables.trigger import CronTriggerTimetable
+
+
+def _get_data(year, month, day, hour, output_path, **_):
+    url = (
+        "https://dumps.wikimedia.org/other/pageviews/"
+        f"{year}/{year}-{month:0>2}/pageviews-{year}{month:0>2}{day:0>2}-{hour:0>2}0000.gz"
+    )
+
+    req = request.Request(
+                url,
+                    headers={
+                                "User-Agent": "AirflowPageviewsStudy/1.0 (ilovegpgp@gmail.com) "
+                                    },
+                    )
+
+    with request.urlopen(req) as response:
+            with open(output_path, "wb") as f:
+                        f.write(response.read())
+
+
+
+
+
+
+def _fetch_pageviews(pagenames, logical_date, **_):
+    result = dict.fromkeys(pagenames, 0)
+    with open(f"/tmp/wikipageviews-{ logical_date.format('YYYYMMDDHH') }") as f:
+        for line in f:
+            domain_code, page_title, view_counts, _ = line.split(" ")
+            if domain_code == "en" and page_title in pagenames:
+                result[page_title] = view_counts
+
+    print(result)
+    # Prints e.g. "{'Facebook': '778', 'Apple': '20', 'Google': '451', 'Amazon': '9', 'Microsoft': '119'}"
+
+
+with DAG(
+    dag_id="07_wikipedia_pageviews",
+    start_date=pendulum.today("UTC").add(hours=-3),
+    schedule=CronTriggerTimetable("@hourly", timezone="UTC"),
+    max_active_runs=1,
+    catchup=True
+):
+    get_data = PythonOperator(
+        task_id="get_data",
+        python_callable=_get_data,
+        op_kwargs={
+            "year": "{{ data_interval_start.year }}",
+            "month": "{{ data_interval_start.month }}",
+            "day": "{{ data_interval_start.day }}",
+            "hour": "{{ data_interval_start.hour }}",
+            "output_path": "/tmp/wikipageviews-{{ data_interval_start.format('YYYYMMDDHH') }}.gz",
+        },
+    )
+
+    extract_gz = BashOperator(
+        task_id="extract_gz",
+        bash_command="gunzip --force /tmp/wikipageviews-{{ data_interval_start.format('YYYYMMDDHH') }}.gz",
+    )
+
+    fetch_pageviews = PythonOperator(
+        task_id="fetch_pageviews",
+        python_callable=_fetch_pageviews,
+        op_kwargs={
+            "pagenames": {
+                "Google",
+                "Amazon",
+                "Apple",
+                "Microsoft",
+                "Facebook",
+            }
+        },
+    )
+
+    get_data >> extract_gz >> fetch_pageviews
